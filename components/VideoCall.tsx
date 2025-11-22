@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import Peer, { MediaConnection } from 'peerjs';
+import { supabase } from '@/lib/supabase';
 
 // TypeScript interfaces for type safety
 interface Message {
@@ -33,7 +34,11 @@ interface CallState {
   remoteStream: MediaStream | null;
 }
 
-const VideoCall = () => {
+interface VideoCallProps {
+  roomId: string;
+}
+
+const VideoCall = ({ roomId }: VideoCallProps) => {
   // State management for the application
   const [peer, setPeer] = useState<Peer | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -62,7 +67,10 @@ const VideoCall = () => {
   useEffect(() => {
     initializePeerConnection();
     initializeSocketConnection();
-    generateUsername();
+    initializePeerConnection();
+    initializeSocketConnection();
+    fetchUserProfile();
+    fetchMessages();
 
     return () => {
       // Cleanup on component unmount
@@ -87,6 +95,30 @@ const VideoCall = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const fetchUserProfile = async () => {
+    if (!supabase) {
+      generateUsername();
+      return;
+    }
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data } = await supabase
+        .from('profiles')
+        .select('full_name, username')
+        .eq('id', user.id)
+        .single();
+      
+      if (data?.full_name || data?.username) {
+        setUsername(data.full_name || data.username || 'User');
+      } else {
+        generateUsername();
+      }
+    } else {
+      generateUsername();
+    }
+  };
+
   const generateUsername = () => {
     const adjectives = ['Cool', 'Smart', 'Happy', 'Bright', 'Swift'];
     const nouns = ['User', 'Person', 'Friend', 'Caller', 'Guest'];
@@ -105,9 +137,13 @@ const VideoCall = () => {
       });
 
       // Create new Peer instance connecting to the public PeerJS server
+      const peerPort = process.env.NEXT_PUBLIC_PEER_PORT 
+        ? parseInt(process.env.NEXT_PUBLIC_PEER_PORT) 
+        : 9000;
+
       const newPeer = new Peer({
         host: window.location.hostname,
-        port: 9000,
+        port: peerPort,
         path: '/myapp',
         secure: false,
         config: {
@@ -184,14 +220,29 @@ const VideoCall = () => {
       console.log('Socket.IO connected');
       // Join a common room for chat
       newSocket.emit('join-room', { 
-        roomId: 'general', 
+        roomId: roomId, 
         username: username || 'Anonymous'
       });
     });
 
     // Handle incoming messages
     newSocket.on('receive-message', (message: Message) => {
-      setMessages(prev => [...prev, message]);
+      // Only add message if it's from someone else, or if we haven't added it optimistically (though here we rely on server)
+      // Actually, simpler fix: The server broadcasts to everyone. 
+      // If we want to avoid duplication, we should check if we already have this message ID? 
+      // Or better: The server sends it back. We just render it. 
+      // The issue might be that we are fetching from Supabase AND getting live updates?
+      // Ah, fetchMessages gets history. Live updates get new ones.
+      // If we send a message, it goes to Supabase AND Socket.
+      // If we are getting double, maybe we are adding it locally in sendMessage? No, we aren't.
+      // Wait, the user said "text coming twice". 
+      // If I reload, I get history. Then I send.
+      // Maybe the server emits twice? Or the component mounts twice (React Strict Mode)?
+      // Let's deduplicate by ID.
+      setMessages(prev => {
+        if (prev.some(m => m.id === message.id)) return prev;
+        return [...prev, message];
+      });
     });
 
     newSocket.on('user-joined', (data) => {
@@ -305,10 +356,48 @@ const VideoCall = () => {
     }
   };
 
+  // Fetch messages from Supabase
+  const fetchMessages = async () => {
+    if (!supabase) return;
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('room_id', roomId)
+      .order('timestamp', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching messages:', error);
+    } else if (data) {
+      setMessages(data);
+    }
+  };
+
   // Send chat message
-  const sendMessage = () => {
+  const sendMessage = async () => {
     if (!socket || !messageInput.trim()) return;
 
+    const messageData = {
+      id: Date.now().toString(), // Generate ID locally for optimistic update/deduplication
+      author: username,
+      content: messageInput.trim(),
+      timestamp: new Date().toISOString(),
+      senderId: socket.id || 'unknown',
+      room_id: roomId
+    };
+
+    // Save to Supabase
+    if (supabase) {
+      const { error } = await supabase
+        .from('messages')
+        .insert([messageData]);
+
+      if (error) {
+        console.error('Error saving message to Supabase:', error);
+      }
+    }
+
+    // Emit to Socket.IO for realtime (optional if using Supabase Realtime, but keeping for now)
     socket.emit('send-message', {
       author: username,
       content: messageInput.trim()
@@ -332,55 +421,57 @@ const VideoCall = () => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-black text-white overflow-hidden">
       {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-cyan-500 rounded-lg flex items-center justify-center">
-              <Video className="w-5 h-5 text-white" />
-            </div>
-            <h1 className="text-2xl font-bold text-cyan-400">Connect</h1>
+      <header className="absolute top-0 left-0 right-0 z-10 p-6 flex justify-between items-center bg-gradient-to-b from-black/50 to-transparent pointer-events-none">
+        <div className="flex items-center space-x-3 pointer-events-auto">
+          <div className="w-10 h-10 bg-cyan-500/20 backdrop-blur-md border border-cyan-500/50 rounded-xl flex items-center justify-center">
+            <Video className="w-6 h-6 text-cyan-400" />
           </div>
-          <div className="flex items-center space-x-4">
-            <span className="text-sm text-gray-400">Welcome, {username}</span>
-            <div className="flex items-center space-x-2">
-              <Users className="w-4 h-4 text-cyan-400" />
-              <span className="text-sm text-cyan-400">
-                {callState.isInCall ? 'In Call' : 'Available'}
-              </span>
-            </div>
+          <h1 className="text-2xl font-bold text-white tracking-tight">Connect</h1>
+        </div>
+        <div className="flex items-center space-x-4 pointer-events-auto">
+          <div className="bg-black/30 backdrop-blur-md border border-white/10 px-4 py-2 rounded-full flex items-center space-x-2">
+            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+            <span className="text-sm font-medium text-gray-200">
+              {callState.isInCall ? 'Connected' : 'Ready'}
+            </span>
           </div>
         </div>
       </header>
 
-      <div className="flex flex-col lg:flex-row h-[calc(100vh-80px)]">
-        {/* Video Section */}
-        <div className="flex-1 lg:flex-[2] p-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 h-full">
+      <div className="flex h-screen pt-20 pb-24 px-6 gap-6">
+        {/* Video Grid */}
+        <div className="flex-1 flex flex-col gap-6 min-w-0">
+          <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Local Video */}
-            <div className="relative bg-gray-800 rounded-xl overflow-hidden">
+            <div className="relative bg-gray-800/50 backdrop-blur-sm rounded-3xl overflow-hidden border border-white/10 shadow-2xl group">
               <video
                 ref={localVideoRef}
                 autoPlay
                 muted
                 playsInline
-                className="w-full h-full object-cover"
+                className="w-full h-full object-cover transform scale-x-[-1]"
               />
-              <div className="absolute bottom-4 left-4">
-                <span className="bg-black bg-opacity-50 px-2 py-1 rounded text-sm">
-                  You
-                </span>
+              <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10">
+                <span className="text-sm font-medium text-white">You ({username})</span>
               </div>
-              {isVideoOff && (
-                <div className="absolute inset-0 bg-gray-900 flex items-center justify-center">
-                  <VideoOff className="w-12 h-12 text-gray-400" />
-                </div>
-              )}
+              <div className="absolute top-4 right-4 flex space-x-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                {isAudioMuted && (
+                  <div className="p-2 bg-red-500/90 rounded-lg">
+                    <MicOff className="w-4 h-4 text-white" />
+                  </div>
+                )}
+                {isVideoOff && (
+                  <div className="p-2 bg-red-500/90 rounded-lg">
+                    <VideoOff className="w-4 h-4 text-white" />
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Remote Video */}
-            <div className="relative bg-gray-800 rounded-xl overflow-hidden">
+            <div className="relative bg-gray-800/50 backdrop-blur-sm rounded-3xl overflow-hidden border border-white/10 shadow-2xl">
               {callState.isInCall ? (
                 <>
                   <video
@@ -389,179 +480,147 @@ const VideoCall = () => {
                     playsInline
                     className="w-full h-full object-cover"
                   />
-                  <div className="absolute bottom-4 left-4">
-                    <span className="bg-black bg-opacity-50 px-2 py-1 rounded text-sm">
-                      Remote Peer
-                    </span>
+                  <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10">
+                    <span className="text-sm font-medium text-white">Remote Peer</span>
                   </div>
                 </>
               ) : (
-                <div className="flex items-center justify-center h-full">
-                  <div className="text-center">
-                    <Users className="w-16 h-16 text-gray-600 mx-auto mb-4" />
-                    <p className="text-gray-400">
-                      {callState.isConnecting ? 'Connecting...' : 'Waiting for peer...'}
-                    </p>
+                <div className="flex flex-col items-center justify-center h-full text-center p-8">
+                  <div className="w-20 h-20 bg-gray-700/50 rounded-full flex items-center justify-center mb-6 animate-pulse">
+                    <Users className="w-10 h-10 text-gray-400" />
                   </div>
+                  <h3 className="text-xl font-semibold text-white mb-2">Waiting for connection</h3>
+                  <p className="text-gray-400 max-w-xs">
+                    Share your Peer ID to start a call
+                  </p>
                 </div>
               )}
             </div>
           </div>
-
-          {/* Controls */}
-          <div className="mt-6 space-y-4">
-            {/* Peer ID Display */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Your Peer ID:
-              </label>
-              <div className="flex space-x-2">
-                <input
-                  type="text"
-                  value={myPeerId}
-                  readOnly
-                  className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
-                />
-                <button
-                  onClick={copyPeerId}
-                  className="bg-cyan-600 hover:bg-cyan-700 px-4 py-2 rounded-lg flex items-center space-x-2 transition-colors"
-                >
-                  <Copy className="w-4 h-4" />
-                  <span>Copy</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Call Controls */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Connect to Peer:
-              </label>
-              <div className="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-2">
-                <input
-                  type="text"
-                  placeholder="Paste peer ID here to start call"
-                  value={remotePeerIdInput}
-                  onChange={(e) => setRemotePeerIdInput(e.target.value)}
-                  className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                />
-                {!callState.isInCall ? (
-                  <button
-                    onClick={callPeer}
-                    disabled={callState.isConnecting}
-                    className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded-lg flex items-center justify-center space-x-2 transition-colors"
-                  >
-                    <Phone className="w-4 h-4" />
-                    <span>{callState.isConnecting ? 'Connecting...' : 'Call'}</span>
-                  </button>
-                ) : (
-                  <button
-                    onClick={endCall}
-                    className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg flex items-center justify-center space-x-2 transition-colors"
-                  >
-                    <PhoneOff className="w-4 h-4" />
-                    <span>End Call</span>
-                  </button>
-                )}
-              </div>
-              <p className="text-xs text-gray-400 mt-2">
-                Share your Peer ID above with someone, then paste their ID here to connect
-              </p>
-            </div>
-
-            {/* Media Controls */}
-            {callState.isInCall && (
-              <div className="flex justify-center space-x-4">
-                <button
-                  onClick={toggleAudio}
-                  className={`p-3 rounded-full transition-colors ${
-                    isAudioMuted 
-                      ? 'bg-red-600 hover:bg-red-700' 
-                      : 'bg-gray-700 hover:bg-gray-600'
-                  }`}
-                >
-                  {isAudioMuted ? (
-                    <MicOff className="w-5 h-5" />
-                  ) : (
-                    <Mic className="w-5 h-5" />
-                  )}
-                </button>
-                <button
-                  onClick={toggleVideo}
-                  className={`p-3 rounded-full transition-colors ${
-                    isVideoOff 
-                      ? 'bg-red-600 hover:bg-red-700' 
-                      : 'bg-gray-700 hover:bg-gray-600'
-                  }`}
-                >
-                  {isVideoOff ? (
-                    <VideoOff className="w-5 h-5" />
-                  ) : (
-                    <Video className="w-5 h-5" />
-                  )}
-                </button>
-              </div>
-            )}
-          </div>
         </div>
 
-        {/* Chat Panel */}
-        <div className="lg:flex-1 bg-gray-800 border-l border-gray-700">
-          <div className="h-full flex flex-col">
-            {/* Chat Header */}
-            <div className="p-4 border-b border-gray-700">
-              <div className="flex items-center space-x-2">
-                <MessageCircle className="w-5 h-5 text-cyan-400" />
-                <h3 className="font-semibold text-cyan-400">Chat</h3>
-              </div>
-            </div>
-
-            {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
-              {messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`flex ${
-                    message.author === username ? 'justify-end' : 'justify-start'
-                  }`}
-                >
-                  <div
-                    className={`max-w-xs lg:max-w-sm px-4 py-2 rounded-lg ${
-                      message.author === username
-                        ? 'bg-cyan-600 text-white'
-                        : 'bg-gray-700 text-gray-100'
-                    }`}
-                  >
-                    <div className="text-xs opacity-75 mb-1">
-                      {message.author} · {formatTime(message.timestamp)}
-                    </div>
-                    <div>{message.content}</div>
-                  </div>
-                </div>
-              ))}
-              <div ref={messagesEndRef} />
-            </div>
-
-            {/* Message Input */}
-            <div className="p-4 border-t border-gray-700">
-              <div className="flex space-x-2">
-                <input
-                  type="text"
-                  placeholder="Type a message..."
-                  value={messageInput}
-                  onChange={(e) => setMessageInput(e.target.value)}
-                  onKeyPress={handleMessageKeyPress}
-                  className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
-                />
-                <button
-                  onClick={sendMessage}
-                  className="bg-cyan-600 hover:bg-cyan-700 px-4 py-2 rounded-lg flex items-center space-x-2 transition-colors"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
+        {/* Chat Sidebar */}
+        <div className="w-96 bg-gray-900/80 backdrop-blur-xl border border-white/10 rounded-3xl flex flex-col overflow-hidden shadow-2xl">
+          <div className="p-4 border-b border-white/10 bg-white/5">
+            <div className="flex items-center space-x-2">
+              <MessageCircle className="w-5 h-5 text-cyan-400" />
+              <h3 className="font-semibold text-white">Live Chat</h3>
             </div>
           </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+            {messages.map((message) => (
+              <div
+                key={message.id}
+                className={`flex flex-col ${
+                  message.author === username ? 'items-end' : 'items-start'
+                }`}
+              >
+                <div className="flex items-baseline space-x-2 mb-1">
+                  <span className="text-xs font-medium text-gray-400">{message.author}</span>
+                  <span className="text-[10px] text-gray-600">{formatTime(message.timestamp)}</span>
+                </div>
+                <div
+                  className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    message.author === username
+                      ? 'bg-cyan-600 text-white rounded-tr-none'
+                      : 'bg-gray-800 text-gray-100 rounded-tl-none'
+                  }`}
+                >
+                  {message.content}
+                </div>
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="p-4 border-t border-white/10 bg-white/5">
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="Type a message..."
+                value={messageInput}
+                onChange={(e) => setMessageInput(e.target.value)}
+                onKeyPress={handleMessageKeyPress}
+                className="w-full bg-gray-800/50 border border-gray-700 rounded-xl pl-4 pr-12 py-3 text-white placeholder-gray-500 focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/50 outline-none transition-all"
+              />
+              <button
+                onClick={sendMessage}
+                className="absolute right-2 top-2 p-1.5 bg-cyan-500 hover:bg-cyan-400 rounded-lg text-white transition-colors"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Floating Control Bar */}
+      <div className="fixed bottom-8 left-1/2 transform -translate-x-1/2 z-50">
+        <div className="bg-gray-900/90 backdrop-blur-xl border border-white/10 rounded-2xl p-2 flex items-center space-x-2 shadow-2xl">
+          <button
+            onClick={toggleAudio}
+            className={`p-4 rounded-xl transition-all duration-200 ${
+              isAudioMuted 
+                ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' 
+                : 'bg-gray-800/50 text-white hover:bg-gray-700/50'
+            }`}
+            title={isAudioMuted ? "Unmute" : "Mute"}
+          >
+            {isAudioMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+          </button>
+          
+          <button
+            onClick={toggleVideo}
+            className={`p-4 rounded-xl transition-all duration-200 ${
+              isVideoOff 
+                ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' 
+                : 'bg-gray-800/50 text-white hover:bg-gray-700/50'
+            }`}
+            title={isVideoOff ? "Turn Camera On" : "Turn Camera Off"}
+          >
+            {isVideoOff ? <VideoOff className="w-6 h-6" /> : <Video className="w-6 h-6" />}
+          </button>
+
+          <div className="w-px h-8 bg-white/10 mx-2" />
+
+          {!callState.isInCall ? (
+            <div className="flex items-center space-x-2">
+              <input
+                type="text"
+                placeholder="Enter Peer ID"
+                value={remotePeerIdInput}
+                onChange={(e) => setRemotePeerIdInput(e.target.value)}
+                className="w-40 bg-gray-800/50 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-cyan-500/50 outline-none"
+              />
+              <button
+                onClick={callPeer}
+                disabled={callState.isConnecting}
+                className="bg-green-600 hover:bg-green-500 text-white px-6 py-3 rounded-xl font-medium transition-colors flex items-center space-x-2"
+              >
+                <Phone className="w-5 h-5" />
+                <span>Call</span>
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={endCall}
+              className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-xl font-medium transition-colors flex items-center space-x-2"
+            >
+              <PhoneOff className="w-5 h-5" />
+              <span>End</span>
+            </button>
+          )}
+
+          <div className="w-px h-8 bg-white/10 mx-2" />
+
+          <button
+            onClick={copyPeerId}
+            className="p-4 rounded-xl bg-gray-800/50 text-white hover:bg-gray-700/50 transition-all"
+            title="Copy My ID"
+          >
+            <Copy className="w-6 h-6" />
+          </button>
         </div>
       </div>
     </div>

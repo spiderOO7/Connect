@@ -1,5 +1,5 @@
-import VideoCall from '@/components/VideoCall';
+import { redirect } from 'next/navigation';
 
 export default function Home() {
-  return <VideoCall />;
+  redirect('/dashboard');
 }
